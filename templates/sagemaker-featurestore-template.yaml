@@ -20,7 +20,7 @@ Metadata:
 
 Parameters:
   SageMakerNotebookName:
-    Default: featurestore-streaming-agg
+    Default: featurestore-kafka
     Type: String
     Description: Name of SageMaker Notebook Instance
     MinLength: 1
@@ -152,8 +152,6 @@ Resources:
           Value: Private
       VpcId: !Ref Vpc
 
-
-
   SageMakerRole:
     Type: AWS::IAM::Role
     Properties:
@@ -242,6 +240,12 @@ Resources:
                   - logs:GetQueryResults
                 Resource:
                   - "*"
+  
+  KinesisStream: 
+    Type: AWS::Kinesis::Stream
+    Properties: 
+        Name: cc-stream 
+        ShardCount: 1
 
   LambdaRole:
     Type: AWS::IAM::Role
@@ -418,7 +422,7 @@ Resources:
       Runtime: python3.7
       Handler: lambda_function.lambda_handler
       Code:
-        S3Bucket: !Sub 'sagemaker-feature-store-streaming-aggregation-${AWS::Region}'
+        S3Bucket: sagemaker-featurestore-kafka
         S3Key: artifacts/latest/InvokeFraudEndpointLambda.zip
       Layers:
         - !Ref Boto3LibLayer
@@ -438,6 +442,24 @@ Resources:
           FRAUD_THRESHOLD: 0.25
           LOG_LEVEL: INFO
           HOME: /tmp
+  
+  PredictLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: KafkaInstance
+    Properties:
+      FunctionName: !GetAtt PredictLambdaFunction.Arn
+      SelfManagedEventSource:
+        Endpoints:
+          KafkaBootstrapServers:
+            - !Join [ '', [ !GetAtt KafkaInstance.PrivateDnsName, ':9092' ] ]
+      SourceAccessConfigurations:
+        - Type: VPC_SUBNET
+          URI: !Join [ '', [ 'subnet:', !Ref PrivateSubnet ] ]
+        - Type: VPC_SECURITY_GROUP
+          URI: !Join [ '', [ 'security_group:', !Ref LambdaSecurityGroup ] ]
+      Topics:
+        - cc-stream
+      StartingPosition: LATEST
 
   IngestLambdaFunction:
     Type: AWS::Lambda::Function
@@ -447,7 +469,7 @@ Resources:
       Runtime: python3.7
       Handler: lambda_function.lambda_handler
       Code:
-        S3Bucket: !Sub 'sagemaker-feature-store-streaming-aggregation-${AWS::Region}'
+        S3Bucket: sagemaker-featurestore-kafka
         S3Key: artifacts/latest/StreamingIngestAggFeatures.zip
       Layers:
         - !Ref Boto3LibLayer
@@ -458,6 +480,49 @@ Resources:
         Variables:
           CC_AGG_FEATURE_GROUP_NAME: !Ref CreditCardAggregateFeatureStoreName
           HOME: /tmp
+  
+  KafkaForwarderLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: KafkaKinesisForwarder
+      Description: LambdaFunction for forwarding the messages from Kafka to Kinesis
+      Runtime: python3.7
+      Handler: lambda_function.lambda_handler
+      Code:
+        S3Bucket: sagemaker-featurestore-kafka
+        S3Key: artifacts/latest/KafkaKinesisForwarder.zip
+      Layers:
+        - !Ref Boto3LibLayer
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt LambdaRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Environment:
+        Variables:
+          STREAM_NAME: !Ref KinesisStream
+          LOG_LEVEL: INFO
+  
+  KafkaForwarderEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: KafkaInstance
+    Properties:
+      FunctionName: !GetAtt KafkaForwarderLambdaFunction.Arn
+      SelfManagedEventSource:
+        Endpoints:
+          KafkaBootstrapServers:
+            - !Join [ '', [ !GetAtt KafkaInstance.PrivateDnsName, ':9092' ] ]
+      SourceAccessConfigurations:
+        - Type: VPC_SUBNET
+          URI: !Join [ '', [ 'subnet:', !Ref PrivateSubnet ] ]
+        - Type: VPC_SECURITY_GROUP
+          URI: !Join [ '', [ 'security_group:', !Ref LambdaSecurityGroup ] ]
+      Topics:
+        - cc-stream
+      StartingPosition: LATEST
   
   FeatureStoreNotebookSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -475,7 +540,7 @@ Resources:
       NotebookInstanceName: !Ref SageMakerNotebookName
       InstanceType: "ml.m5.xlarge"
       RoleArn: !GetAtt SageMakerRole.Arn
-      DefaultCodeRepository: "https://github.com/aws-samples/amazon-sagemaker-feature-store-streaming-aggregation"
+      DefaultCodeRepository: "https://github.com/vlesierse/amazon-sagemaker-feature-store-kafka"
       SubnetId: !Ref PrivateSubnet
       SecurityGroupIds:
         - !Ref FeatureStoreNotebookSecurityGroup
@@ -501,6 +566,8 @@ Resources:
 
   KafkaInstance:
     Type: AWS::EC2::Instance
+    DependsOn:
+      - NatRoute
     Properties:
       ImageId: !Ref LatestAmiId
       InstanceType: t3.small
@@ -515,6 +582,7 @@ Resources:
           
           # Install Docker
           yum install -y docker
+          usermod -a -G docker ec2-user
           systemctl enable docker.service
           systemctl start docker.service
           
@@ -525,9 +593,11 @@ Resources:
 
           # Install & Run Kafka
           mkdir -p /app/kafka
-          curl -L https://sagemaker-featurestore-kafka.s3.eu-west-1.amazonaws.com/artifacts/latest/kakfa-docker-compose.yml -o /app/kafka/docker-compose.yml
+          curl -L https://sagemaker-featurestore-kafka.s3.eu-west-1.amazonaws.com/artifacts/latest/docker-compose.yml -o /app/kafka/docker-compose.yml
           echo "HOSTNAME=$HOSTNAME" > /app/kafka/.env
           docker-compose -f /app/kafka/docker-compose.yml up -d
+          sleep 30
+          docker run --net=kafka_default --rm confluentinc/cp-kafka kafka-topics --create --topic cc-stream --partitions 1 --replication-factor 1 --if-not-exists --bootstrap-server $HOSTNAME:9092
       Tags:
         - Key: Name
           Value: FeatureStoreKafkaInstance
@@ -562,6 +632,5 @@ Outputs:
   KafkaEndpoint:
     Description: Kafka Endpoint
     Value: !GetAtt KafkaInstance.PrivateDnsName
-    Export:
-      Name:
-        Fn::Sub: KafkaEndpoint
+  KinesisStream:
+    Value: !Ref KinesisStream
