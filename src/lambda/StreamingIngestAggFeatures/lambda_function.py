@@ -46,9 +46,12 @@ def lambda_handler(event, context):
         cc_num = agg_data['cc_num']
         num_trans_last_10m = agg_data['num_trans_last_10m']
         avg_amt_last_10m = agg_data['avg_amt_last_10m']
-
-        print(f' updating agg features for card: {cc_num}, avg amt last 10m: {avg_amt_last_10m}, num trans last 10m: {num_trans_last_10m}')
-        update_agg(CC_AGG_FEATURE_GROUP, cc_num, avg_amt_last_10m, num_trans_last_10m)
+        
+        if cc_num is not None:
+            print(f'Updating agg features for card: {cc_num}, avg amt last 10m: {avg_amt_last_10m}, num trans last 10m: {num_trans_last_10m}')
+            update_agg(CC_AGG_FEATURE_GROUP, cc_num, avg_amt_last_10m, num_trans_last_10m)
+        else:
+            print(f'Incorrect record found!')
         
         # Flag each record as being "Ok", so that Kinesis won't try to re-send 
         ret_records.append({'recordId': rec['recordId'],

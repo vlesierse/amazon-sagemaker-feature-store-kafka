@@ -50,45 +50,42 @@ def lambda_handler(event, context):
     """
     logging.debug('Received event: {}'.format(json.dumps(event, indent=2)))
 
-    records = event['Records']
+    records = event['records']
     logging.debug('Event contains {} records'.format(len(records)))
     
-    ret_records = []
-    for rec in records:
-        # Each record has separate eventID, etc.
-        event_id = rec['eventID']
-        event_source_arn = rec['eventSourceARN']
-        logging.debug(f'eventID: {event_id}, eventSourceARN: {event_source_arn}')
+    for rec in records.values():
+        for part in rec:
+            # Each record has separate eventID, etc.
+            topic = part['topic']
+            partition = part['partition']
+            offset = part['offset']
+            logging.debug(f'topic: {topic}, partition: {partition}, offset: {offset}')
+    
+            value = part['value']
+            event_payload = decode_payload(value)
+    
+            # Collect fields from event payload
+            cc_num = event_payload['cc_num']
+            amount = event_payload['amount']
+            logging.info(f'Event payload data: cc_num: {cc_num} transaction amount: {amount} ')
+    
+            if 'trans_ts' in event_payload:
+                trans_ts = event_payload['trans_ts']
+                calc_trans_time_delay(trans_ts)
+    
+            aggregate_dict, cutoff_condition = lookup_features(cc_num, amount)
+            if aggregate_dict is None:
+                continue
+    
+            feature_string = assemble_features(amount, aggregate_dict)
+            prediction = invoke_endpoint(feature_string, cc_num)
+            
+            dump_stats(prediction, cc_num, amount, aggregate_dict, cutoff_condition)
+            
+            if prediction is None:
+                return {'statusCode': 500, 'body': 'Incorrect prediction, retry!'}
 
-        kinesis = rec['kinesis']
-        event_payload = decode_payload(kinesis['data'])
-
-        # Collect fields from event payload
-        cc_num = event_payload['cc_num']
-        amount = event_payload['amount']
-        logging.info(f'Event payload data: cc_num: {cc_num} transaction amount: {amount} ')
-
-        if 'trans_ts' in event_payload:
-            trans_ts = event_payload['trans_ts']
-            calc_trans_time_delay(trans_ts)
-
-        aggregate_dict, cutoff_condition = lookup_features(cc_num, amount)
-        if aggregate_dict is None:
-            continue
-
-        feature_string = assemble_features(amount, aggregate_dict)
-        prediction = invoke_endpoint(feature_string, cc_num)
-        
-        dump_stats(prediction, cc_num, amount, aggregate_dict, cutoff_condition)
-        
-        if prediction is not None:
-            sequence_num = kinesis['sequenceNumber']
-            ret_records.append({'eventId': event_id,
-                            'sequenceNumber': sequence_num,
-                            'prediction': prediction,
-                            'statusCode': 200})
-
-    return ret_records
+    return {'statusCode': 200}
 
 
 def decode_payload(event_data):
